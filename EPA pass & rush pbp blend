@@ -1,0 +1,215 @@
+library(nflscrapR)
+library(tidyverse)
+library(dplyr)
+library(na.tools)
+library(ggimage)
+library(nflfastR)
+
+
+##Grab the last 6 years of play by play data. This is sourced from Ben Baldwin's github account. He is a sports writer for the Athletic can be found on twitter @BenBBaldwin
+
+seasons <- 2015:2020          
+pbp <- purrr::map_df(seasons, function(x) {
+  readRDS(
+    url(
+      glue::glue("https://raw.githubusercontent.com/guga31bb/nflfastR-data/master/data/play_by_play_{x}.rds")
+    )
+  )
+}
+)
+
+
+clean_pbp(pbp) ##this adds a few dozen important columns
+
+
+
+pbpSkinny <- pbp %>%          ##Main Dataset. With data blending below, we'll add a few columns.
+  filter(wp < 0.9) %>%
+  filter(wp > 0.1) %>%
+  filter(play_type_nfl %in% c("RUSH","PASS")) %>%
+  select(season,rusher_player_name,receiver_player_name,game_id,week,posteam,defteam,play_id,desc,epa,ep,yards_gained,yardline_100,
+         total_home_score,total_away_score,pass,rush,play_type,play_type_nfl,down,ydstogo,rusher_player_id,receiver_player_id,home_team,season_type,wp,score_differential,
+         game_seconds_remaining)
+
+    
+    
+    
+    
+         
+RushRank <- pbp %>%          ##Rank Rushers by count of weeks where they were the highest rushes taken, then 2nd highest, etc.
+  filter(wp < 0.9) %>%
+  filter(wp > 0.1) %>%
+  filter(play_type_nfl == "RUSH") %>%
+  group_by(season, week, game_id, posteam, defteam, rusher_player_name,rusher_player_id) %>%
+  summarise(rushes = n()) %>%
+  arrange(season, week, posteam, desc(rushes)) %>%
+  group_by(season, week, posteam) %>%
+  mutate(rank = rank(desc(rushes), ties.method = "first")) %>%
+  rename(id = rusher_player_id)
+  
+Passers <- pbp %>%                  ##Need to exclude QBs from the list of rushers
+  filter(play_type_nfl == "PASS") %>%
+  group_by(season, posteam, passer_player_name, passer_player_id) %>%
+  summarize(passes = n()) %>%
+  filter(passes > 10) %>%
+  rename(id = passer_player_id)
+  
+RushRank2 <- anti_join(RushRank,Passers,by = "id")
+  
+RushRankSum <- RushRank2 %>%
+  group_by(season,posteam,rusher_player_name,id,rank) %>%
+  summarise(weeks_at_rank = n()) %>%
+  arrange(season,posteam,desc(weeks_at_rank))
+  
+  
+RushPosRank <- RushRankSum %>%        
+  arrange(season,posteam,id,desc(rank)) %>%
+  group_by(season,posteam,rank) %>%
+  mutate(PosRank = rank(desc(weeks_at_rank), ties.method = "first")) %>%
+  filter(PosRank == 1 & weeks_at_rank != 1) %>%
+  select(-weeks_at_rank,-PosRank) %>%
+  rename(RBRank = rank)
+
+##After ranking RBs by number of weeks with the most rushes, we need to get rid of records where the RB ranked in more than one spot to avoid duplication
+RushPosRank <- RushPosRank %>%              
+  group_by(season,posteam,id) %>%
+  slice(which.min(RBRank))
+
+
+
+
+
+
+
+
+RecRank <- pbp %>%          ##Rank Receivers by count of weeks where they were the highest rushes taken, then 2nd highest, etc.
+  filter(wp < 0.9) %>%
+  filter(wp > 0.1) %>%
+  filter(play_type_nfl == "PASS") %>%
+  filter(!is.na(receiver_player_id)) %>%
+  group_by(season, week, game_id, posteam, defteam, receiver_player_name,receiver_player_id) %>%
+  summarise(rushes = n()) %>%
+  arrange(season, week, posteam, desc(rushes)) %>%
+  group_by(season, week, posteam) %>%
+  mutate(rank = rank(desc(rushes), ties.method = "first"))
+  
+RecRankSum <- RecRank %>%
+  group_by(season,posteam,receiver_player_name,receiver_player_id,rank) %>%
+  summarise(weeks_at_rank = n()) %>%
+  arrange(season,posteam,desc(weeks_at_rank))
+  
+  
+RecPosRank <- RecRankSum %>%        ##this is what will get joined back to the main dataset
+  arrange(season,posteam,receiver_player_id,desc(rank)) %>%
+  group_by(season,posteam,rank) %>%
+  mutate(PosRank = rank(desc(weeks_at_rank), ties.method = "first")) %>%
+  filter(PosRank == 1 & weeks_at_rank != 1) %>%
+  select(-weeks_at_rank,-PosRank) %>%
+  rename(RecRank = rank)
+  
+RecPosRank <- RecPosRank %>%
+  group_by(season,posteam,receiver_player_id) %>%
+  slice(which.min(RecRank))
+  
+  
+  
+  
+  
+  
+games <- read_csv("http://www.habitatring.com/games.csv")  ##Game-level data - provided by Lee Sharpe, found on twitter as @LeeSharpeNFL
+
+games <- games %>%                ##Blend to get regular season win-loss record. will need to split away/home data, then union
+  filter(season > 2014) %>%
+  mutate(home_win_loss = case_when(result > 0 ~ 1,
+                                   result == 0 ~ .5,
+                                   result < 0 ~ 0),
+         away_win_loss = case_when(result < 0 ~ 1,
+                                   result == 0 ~ .5,
+                                   result > 0 ~ 0))
+                                   
+home_reg <- games %>%
+  filter(game_type == "REG") %>%
+  group_by(season,home_team) %>%
+  summarize(home_wins = sum(home_win_loss), home_losses = sum(away_win_loss))
+  
+away_reg <- games %>%
+  filter(game_type == "REG") %>%
+  group_by(season,away_team) %>%
+  summarize(away_wins = sum(away_win_loss), away_losses = sum(home_win_loss))
+
+win_loss <- inner_join(home_reg,away_reg,by = c("season","home_team"="away_team"))
+
+win_loss <- win_loss %>%
+  mutate(home_team_reg_season_wins = home_wins+away_wins,
+         home_team_reg_season_losses = home_losses+away_losses) %>%
+  select(season,home_team,home_team_reg_season_wins,home_team_reg_season_losses)
+
+
+
+
+
+
+
+home_playoff <-games %>%        ##filter to playoff games to create a playoff team flag
+  filter(season > 2014) %>%
+  filter(game_type != "REG") %>%
+  group_by(season,home_team) %>%
+  summarize(games_played = n()) %>%
+  rename(team = home_team)
+  
+away_playoff <-games %>%
+  filter(season > 2014) %>%
+  filter(game_type != "REG") %>%
+  group_by(season,away_team) %>%
+  summarize(games_played = n()) %>%
+  rename(team = away_team)
+  
+playoff_teams <- rbind(home_playoff,away_playoff) %>%
+  group_by(season,team) %>%
+  summarise(posteam_playoff_games = sum(games_played))
+
+
+
+
+
+
+
+final <- games %>%            ##grab game-level final outcomes
+  filter(season > 2014) %>%
+  select(game_id,season,home_score,away_score,result,home_win_loss,away_win_loss)%>%
+  rename(final_score_home_team = home_score, final_score_away_team = away_score,final_point_diff_home_team = result,
+         home_team_win = home_win_loss, away_team_win = away_win_loss)
+
+
+
+
+
+
+
+
+###Blend all data together - need to be mindful that the game-level and season-level data will be at a different level of detail than the pbp data and will cause double counting if used incorrectly
+
+pbpSkinny <- left_join(pbpSkinny,RushPosRank, by = c("season","posteam","rusher_player_name","rusher_player_id"="id"))
+
+pbpSkinny <- left_join(pbpSkinny,RecPosRank, by = c("season","posteam","receiver_player_name","receiver_player_id"))
+
+pbpSkinny <- left_join(pbpSkinny,win_loss, by = c("season","home_team"))
+
+pbpSkinny <- left_join(pbpSkinny,playoff_teams, by = c("season","posteam"="team"))
+
+pbpSkinny <- left_join(pbpSkinny,final,by = c("season","game_id"))
+
+
+
+##add fields to simplify any posteam vs hometeam calculation issues brought up by join availability
+pbpSkinny <- pbpSkinny %>%
+  mutate(posteam_win = ifelse(posteam == home_team,home_team_win,away_team_win),
+         final_score_posteam = ifelse(posteam == home_team,final_score_home_team,final_score_away_team),
+         final_point_diff_posteam = ifelse(posteam == home_team,final_point_diff_home_team,final_point_diff_home_team*-1))
+
+
+
+
+
+##Output that glorious data!
+write.csv(pbpSkinny,"NFL_Pass_Rush_Analysis.csv")
